@@ -211,7 +211,7 @@ def start_command(message):
     send_main_menu(message.chat.id, "Bienvenido a la Bóveda Lumina.\nEnvía un enlace, varios enlaces juntos, o un archivo TXT de Mediafire Premium para añadirlos al catálogo.")
 
 # ==========================================
-# MOTOR DE CARGA MASIVA (TXT, Bloques y Unitario)
+# MOTOR DE CARGA MASIVA (TXT, Bloques y Unitario) + LOG DE ERRORES
 # ==========================================
 @bot.message_handler(content_types=['text', 'document'])
 def process_mediafire_inputs(message):
@@ -240,27 +240,31 @@ def process_mediafire_inputs(message):
     # 3. Escanear y purificar todos los enlaces (solo atrapa URLs de Mediafire)
     urls_encontradas = [palabra for palabra in texto_crudo.split() if 'mediafire.com' in palabra and palabra.startswith('http')]
     
-    # 4. Eliminar duplicados manteniendo el orden para evitar cargas dobles a Sheets
+    # 4. Eliminar duplicados manteniendo el orden
     urls_unicas = list(dict.fromkeys(urls_encontradas))
     total_urls = len(urls_unicas)
     
-    # Validaciones de seguridad
     if total_urls == 0:
         if message.content_type == 'document':
             bot.reply_to(message, "⚠️ No detecté enlaces válidos de Mediafire en este archivo.")
-        return # Si es texto normal sin links, lo ignoramos para que el bot no responda a charlas comunes
+        return 
 
     # 5. Iniciar Interfaz de Estado Dinámica
     if total_urls == 1:
         msg_status = bot.reply_to(message, "⏳ *Procesando enlace...*\nLimpiando título y extrayendo miniatura...", parse_mode="Markdown")
     else:
-        msg_status = bot.reply_to(message, f"⏳ *CARGA MASIVA INICIADA*\n━━━━━━━━━━━━━━━━━━\n📁 Enlaces detectados: `{total_urls}`\n⚙️ Actualizando progreso cada 10 subidas para proteger el servidor...", parse_mode="Markdown")
+        msg_status = bot.reply_to(message, f"⏳ *CARGA MASIVA INICIADA*\n━━━━━━━━━━━━━━━━━━\n📁 Enlaces detectados: `{total_urls}`\n⚙️ Actualizando progreso cada 10 subidas...", parse_mode="Markdown")
     
     exitos = 0
     fallos = 0
+    enlaces_malos = []
+    msg_errores_id = None
+    clean_name = ""
     
     # 6. Bucle Principal de Procesamiento Forense
     for i, url in enumerate(urls_unicas, 1):
+        hubo_error = False
+        
         try:
             # A) Limpieza Inteligente y Estricta del Título (DOBLE DECODIFICACIÓN Y REGEX)
             raw_name = url.split('/')[-2] if len(url.split('/')) > 2 else f"Video_Sin_Nombre_{i}"
@@ -285,7 +289,7 @@ def process_mediafire_inputs(message):
             b64_string = "data:image/jpeg;base64," + base64.b64encode(out).decode('utf-8') if out else ""
                 
             # C) Empaquetado y Envío a la Bóveda (Google Sheets)
-            video_id = str(int(time.time()) + i) # Se suma 'i' para garantizar IDs únicos en subidas muy rápidas
+            video_id = str(int(time.time()) + i) 
             payload = {
                 "id": video_id,
                 "titulo": clean_name,
@@ -299,24 +303,48 @@ def process_mediafire_inputs(message):
             if response.status_code == 200:
                 exitos += 1
             else:
-                fallos += 1
+                hubo_error = True
                 
         except Exception:
-            fallos += 1
+            hubo_error = True
             
-        # 7. Regla de Refresco: Actualizar la barra de progreso EXACTAMENTE cada 10 enlaces
+        # ==========================================
+        # SISTEMA "LIVE ERROR LOG"
+        # ==========================================
+        if hubo_error:
+            fallos += 1
+            enlaces_malos.append(url)
+            
+            texto_errores = "⚠️ *ENLACES CON ERROR (Actualización en vivo):*\n━━━━━━━━━━━━━━━━━━\n"
+            texto_errores += "\n".join([f"`{link}`" for link in enlaces_malos])
+            
+            if not msg_errores_id:
+                try:
+                    err_msg = bot.reply_to(message, texto_errores, parse_mode="Markdown")
+                    msg_errores_id = err_msg.message_id
+                except:
+                    pass
+            else:
+                try:
+                    bot.edit_message_text(texto_errores, chat_id=chat_id, message_id=msg_errores_id, parse_mode="Markdown")
+                except:
+                    pass
+            
+        # ==========================================
+        # ACTUALIZACIÓN DE PROGRESO PRINCIPAL (Cada 10)
+        # ==========================================
         if total_urls > 1 and i % 10 == 0:
             try:
                 bot.edit_message_text(f"⏳ *PROCESANDO LOTE...*\n━━━━━━━━━━━━━━━━━━\n📊 Avance: `{i}/{total_urls}`\n✅ Exitosos: `{exitos}`\n❌ Errores: `{fallos}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
             except:
-                pass # Evitamos que un fallo de edición temporal en Telegram detenga el ciclo completo
+                pass 
 
     # 8. Resumen Final
     if total_urls == 1:
         if exitos == 1:
             bot.edit_message_text(f"✅ *Video Guardado Exitosamente*\n\n📄 *Título:* `{clean_name}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
         else:
-            bot.edit_message_text("❌ Error al guardar en la base de datos.", chat_id=chat_id, message_id=msg_status.message_id)
+            bot.edit_message_text("❌ Error al guardar en la base de datos. Verifica el enlace de error arriba.", chat_id=chat_id, message_id=msg_status.message_id)
     else:
         bot.edit_message_text(f"✅ *CARGA MASIVA FINALIZADA*\n━━━━━━━━━━━━━━━━━━\n📁 Total escaneados: `{total_urls}`\n✅ Subidos a la Bóveda: `{exitos}`\n❌ Errores detectados: `{fallos}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
     
@@ -352,5 +380,5 @@ def return_menu(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     send_main_menu(call.message.chat.id)
 
-print("🚀 Lumina Streaming Vault (Bulk Loader) Iniciado...")
+print("🚀 Lumina Streaming Vault (Bulk Loader & Live Error Log) Iniciado...")
 bot.infinity_polling()
