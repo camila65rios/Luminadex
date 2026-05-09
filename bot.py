@@ -208,79 +208,119 @@ def send_main_menu(chat_id, text="Panel de Control del Catálogo:"):
 
 @bot.message_handler(commands=['start', 'menu'])
 def start_command(message):
-    send_main_menu(message.chat.id, "Bienvenido a la Bóveda Lumina.\nEnvía un enlace de Mediafire Premium para añadirlo automáticamente al catálogo.")
+    send_main_menu(message.chat.id, "Bienvenido a la Bóveda Lumina.\nEnvía un enlace, varios enlaces juntos, o un archivo TXT de Mediafire Premium para añadirlos al catálogo.")
 
-@bot.message_handler(func=lambda m: m.text.startswith('http'))
-def process_mediafire_link(message):
+# ==========================================
+# MOTOR DE CARGA MASIVA (TXT, Bloques y Unitario)
+# ==========================================
+@bot.message_handler(content_types=['text', 'document'])
+def process_mediafire_inputs(message):
     chat_id = message.chat.id
-    url = message.text.strip()
+    texto_crudo = ""
     
-    if "mediafire.com" not in url:
-        bot.reply_to(message, "⚠️ El enlace no parece ser de Mediafire.")
-        return
-
-    msg_status = bot.reply_to(message, "⏳ *Procesando enlace...*\nLimpiando título y extrayendo miniatura...", parse_mode="Markdown")
-
-    try:
-        # 1. Limpieza Inteligente y Estricta del Título (DOBLE DECODIFICACIÓN Y REGEX)
-        raw_name = url.split('/')[-2] if len(url.split('/')) > 2 else "Video_Sin_Nombre"
-        
-        # Descodificar doble vez para limpiar códigos como %2523 -> %23 -> #
-        decoded_name = urllib.parse.unquote(urllib.parse.unquote(raw_name))
-        
-        # Remover la extensión si existe
-        decoded_name = decoded_name.replace('.mp4', '').replace('.mkv', '').replace('.avi', '')
-        
-        # Expresión Regular: Mantener solo letras, números y espacios (elimina #, símbolos, emojis)
-        clean_name = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]', ' ', decoded_name)
-        
-        # Eliminar espacios múltiples que hayan quedado
-        clean_name = re.sub(r'\s+', ' ', clean_name).strip()
-        
-        if not clean_name:
-            clean_name = "Video Guardado" # Fallback por si el título era solo símbolos
-        
-        # 2. Extracción de Fotograma con FFmpeg
-        cmd = [
-            'ffmpeg', '-ss', '35', '-i', url, '-vframes', '1', 
-            '-q:v', '5', '-vf', 'scale=480:-1', 
-            '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'
-        ]
-        
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        out, _ = process.communicate()
-        
-        if not out:
-            b64_string = ""
-        else:
-            b64_string = "data:image/jpeg;base64," + base64.b64encode(out).decode('utf-8')
+    # 1. Detectar si el usuario envió un archivo .txt
+    if message.content_type == 'document':
+        if not message.document.file_name.endswith('.txt'):
+            bot.reply_to(message, "⚠️ El archivo de la bóveda debe ser formato .txt")
+            return
             
-        # 3. Empaquetado y Envío a Google Sheets
-        video_id = str(int(time.time()))
-        payload = {
-            "id": video_id,
-            "titulo": clean_name,
-            "enlace": url,
-            "portada": b64_string,
-            "fecha": time.strftime("%d/%m/%Y")
-        }
-        
-        response = requests.post(SHEET_URL, json=payload)
-        
-        if response.status_code == 200:
-            bot.delete_message(chat_id, msg_status.message_id)
-            bot.send_message(
-                chat_id, 
-                f"✅ *Video Guardado Exitosamente*\n\n📄 *Título:* `{clean_name}`", 
-                parse_mode="Markdown"
-            )
-            send_main_menu(chat_id, "¿Qué deseas hacer ahora?")
+        msg_lectura = bot.reply_to(message, "⏳ *Extrayendo enlaces del documento...*", parse_mode="Markdown")
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            texto_crudo = downloaded_file.decode('utf-8')
+            bot.delete_message(chat_id, msg_lectura.message_id)
+        except Exception as e:
+            bot.edit_message_text("❌ Error al leer el documento de la bóveda.", chat_id=chat_id, message_id=msg_lectura.message_id)
+            return
+    else:
+        # 2. Si es un mensaje de texto normal
+        texto_crudo = message.text
+
+    # 3. Escanear y purificar todos los enlaces (solo atrapa URLs de Mediafire)
+    urls_encontradas = [palabra for palabra in texto_crudo.split() if 'mediafire.com' in palabra and palabra.startswith('http')]
+    
+    # 4. Eliminar duplicados manteniendo el orden para evitar cargas dobles a Sheets
+    urls_unicas = list(dict.fromkeys(urls_encontradas))
+    total_urls = len(urls_unicas)
+    
+    # Validaciones de seguridad
+    if total_urls == 0:
+        if message.content_type == 'document':
+            bot.reply_to(message, "⚠️ No detecté enlaces válidos de Mediafire en este archivo.")
+        return # Si es texto normal sin links, lo ignoramos para que el bot no responda a charlas comunes
+
+    # 5. Iniciar Interfaz de Estado Dinámica
+    if total_urls == 1:
+        msg_status = bot.reply_to(message, "⏳ *Procesando enlace...*\nLimpiando título y extrayendo miniatura...", parse_mode="Markdown")
+    else:
+        msg_status = bot.reply_to(message, f"⏳ *CARGA MASIVA INICIADA*\n━━━━━━━━━━━━━━━━━━\n📁 Enlaces detectados: `{total_urls}`\n⚙️ Actualizando progreso cada 10 subidas para proteger el servidor...", parse_mode="Markdown")
+    
+    exitos = 0
+    fallos = 0
+    
+    # 6. Bucle Principal de Procesamiento Forense
+    for i, url in enumerate(urls_unicas, 1):
+        try:
+            # A) Limpieza Inteligente y Estricta del Título (DOBLE DECODIFICACIÓN Y REGEX)
+            raw_name = url.split('/')[-2] if len(url.split('/')) > 2 else f"Video_Sin_Nombre_{i}"
+            decoded_name = urllib.parse.unquote(urllib.parse.unquote(raw_name))
+            decoded_name = decoded_name.replace('.mp4', '').replace('.mkv', '').replace('.avi', '')
+            clean_name = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]', ' ', decoded_name)
+            clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+            
+            if not clean_name:
+                clean_name = f"Video Guardado {i}"
+            
+            # B) Extracción de Fotograma con FFmpeg (Enlace Directo)
+            cmd = [
+                'ffmpeg', '-ss', '35', '-i', url, '-vframes', '1', 
+                '-q:v', '5', '-vf', 'scale=480:-1', 
+                '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'
+            ]
+            
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            out, _ = process.communicate()
+            
+            b64_string = "data:image/jpeg;base64," + base64.b64encode(out).decode('utf-8') if out else ""
+                
+            # C) Empaquetado y Envío a la Bóveda (Google Sheets)
+            video_id = str(int(time.time()) + i) # Se suma 'i' para garantizar IDs únicos en subidas muy rápidas
+            payload = {
+                "id": video_id,
+                "titulo": clean_name,
+                "enlace": url,
+                "portada": b64_string,
+                "fecha": time.strftime("%d/%m/%Y")
+            }
+            
+            response = requests.post(SHEET_URL, json=payload)
+            
+            if response.status_code == 200:
+                exitos += 1
+            else:
+                fallos += 1
+                
+        except Exception:
+            fallos += 1
+            
+        # 7. Regla de Refresco: Actualizar la barra de progreso EXACTAMENTE cada 10 enlaces
+        if total_urls > 1 and i % 10 == 0:
+            try:
+                bot.edit_message_text(f"⏳ *PROCESANDO LOTE...*\n━━━━━━━━━━━━━━━━━━\n📊 Avance: `{i}/{total_urls}`\n✅ Exitosos: `{exitos}`\n❌ Errores: `{fallos}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
+            except:
+                pass # Evitamos que un fallo de edición temporal en Telegram detenga el ciclo completo
+
+    # 8. Resumen Final
+    if total_urls == 1:
+        if exitos == 1:
+            bot.edit_message_text(f"✅ *Video Guardado Exitosamente*\n\n📄 *Título:* `{clean_name}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
         else:
             bot.edit_message_text("❌ Error al guardar en la base de datos.", chat_id=chat_id, message_id=msg_status.message_id)
-
-    except Exception as e:
-        error_str = str(e).replace('_', '\\_')
-        bot.edit_message_text(f"❌ *Error interno:*\n`{error_str}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
+    else:
+        bot.edit_message_text(f"✅ *CARGA MASIVA FINALIZADA*\n━━━━━━━━━━━━━━━━━━\n📁 Total escaneados: `{total_urls}`\n✅ Subidos a la Bóveda: `{exitos}`\n❌ Errores detectados: `{fallos}`", chat_id=chat_id, message_id=msg_status.message_id, parse_mode="Markdown")
+    
+    send_main_menu(chat_id, "¿Qué deseas hacer ahora?")
 
 @bot.callback_query_handler(func=lambda call: call.data == "history")
 def show_history(call):
@@ -312,5 +352,5 @@ def return_menu(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     send_main_menu(call.message.chat.id)
 
-print("🚀 Lumina Streaming Vault Iniciado...")
+print("🚀 Lumina Streaming Vault (Bulk Loader) Iniciado...")
 bot.infinity_polling()
